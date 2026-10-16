@@ -6,37 +6,26 @@ import yfinance as yf
 
 # Configuración de la página
 st.set_page_config(
-    page_title="Forex Price Action Analyzer (1H + 5M)", layout="wide"
+    page_title="Forex SMC & Price Action Analyzer", layout="wide"
 )
 
 st.title(
-    "📈 Analizador Avanzado de Price Action (Zonas 1H + Confirmación 5M)"
+    "📈 Analizador SMC & Price Action (OB + FVG en 1H + Confirmación en 5M)"
 )
 st.markdown(
     """
-Esta aplicación combina dos temporalidades para tu operativa:
-* **Gráfico 1H (Zonas Macro):** Identificación visual de soportes y resistencias estructurales.
-* **Gráfico 5M (Gatillo Micro):** Detalle de la acción del precio para buscar la confirmación de entrada.
+Esta herramienta detecta automáticamente zonas institucionales en **1H** (Order Blocks y Fair Value Gaps impulsados por rompimientos de estructura BOS) y las proyecta para buscar la confirmación en **5M**.
 """
 )
 
-# Sidebar de configuración
-st.sidebar.header("⚙️ Parámetros de Configuración")
+# Sidebar
+st.sidebar.header("⚙️ Configuración")
 ticker_symbol = st.sidebar.selectbox(
-    "Par de Divisas (Yahoo Finance)",
-    [
-        "EURUSD=X",
-        "GBPUSD=X",
-        "USDJPY=X",
-        "AUDUSD=X",
-        "USDCAD=X",
-        "EURGBP=X",
-    ],
-    index=0,
+    "Par de Divisas", ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"], index=0
 )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ Reglas de Gestión de Riesgo")
+st.sidebar.subheader("🛡️ Control de Riesgo")
 st.sidebar.info(
     "• Máximo 3 operaciones abiertas simultáneamente.\n• Hasta 4 operaciones perdedoras permitidas por día."
 )
@@ -57,74 +46,114 @@ def cargar_datos(ticker):
     return df_1h, df_5m
 
 
-with st.spinner(f"Cargando y procesando datos para {ticker_symbol}..."):
+with st.spinner("Cargando datos de mercado..."):
     try:
         data_1h, data_5m = cargar_datos(ticker_symbol)
     except Exception as e:
-        st.error(f"Error al descargar los datos: {e}")
+        st.error(f"Error: {e}")
         st.stop()
 
 
-def identificar_zonas_1h(df, df_5m_ref):
+def detectar_zonas_smc_1h(df, df_5m_ref):
+    """Detecta Fair Value Gaps (FVG) y Order Blocks (OB) basados en estructura de 1H."""
     df = df.copy()
-    window = 10
-    df["Resistencia_1H"] = df["High"].rolling(window=window, center=True).max()
-    df["Soporte_1H"] = df["Low"].rolling(window=window, center=True).min()
+    fvg_list = []
+    ob_list = []
 
-    resistencias = df["Resistencia_1H"].dropna().unique()
-    soportes = df["Soporte_1H"].dropna().unique()
+    # Calcular rangos y cuerpos
+    df["Body"] = abs(df["Close"] - df["Open"])
+    df["Range"] = df["High"] - df["Low"]
+    avg_range = df["Range"].mean()
+
+    # Recorrer el DataFrame de 1H buscando patrones institucionales (últimas 100 velas)
+    for i in range(2, len(df) - 1):
+        # 1. Detección de Fair Value Gaps (FVG)
+        # Impulso alcista: El Low de la vela i es mayor que el High de la vela i-2
+        if df["Low"].iloc[i] > df["High"].iloc[i - 2]:
+            fvg_list.append(
+                {
+                    "tipo": "FVG Alcista",
+                    "zona_inferior": df["High"].iloc[i - 2],
+                    "zona_superior": df["Low"].iloc[i],
+                    "tiempo": df.index[i],
+                }
+            )
+        # Impulso bajista: El High de la vela i es menor que el Low de la vela i-2
+        elif df["High"].iloc[i] < df["Low"].iloc[i - 2]:
+            fvg_list.append(
+                {
+                    "tipo": "FVG Bajista",
+                    "zona_inferior": df["High"].iloc[i],
+                    "zona_superior": df["Low"].iloc[i - 2],
+                    "tiempo": df.index[i],
+                }
+            )
+
+        # 2. Detección de Order Blocks (OB)
+        # Impulso alcista fuerte (vela grande tras una bajista)
+        if (
+            df["Close"].iloc[i] > df["Open"].iloc[i]
+            and df["Range"].iloc[i] > avg_range * 1.2
+            and df["Close"].iloc[i - 1] < df["Open"].iloc[i - 1]
+        ):
+            ob_list.append(
+                {
+                    "tipo": "OB Alcista",
+                    "zona_inferior": df["Low"].iloc[i - 1],
+                    "zona_superior": df["High"].iloc[i - 1],
+                    "tiempo": df.index[i - 1],
+                }
+            )
+        # Impulso bajista fuerte (vela grande tras una alcista)
+        elif (
+            df["Close"].iloc[i] < df["Open"].iloc[i]
+            and df["Range"].iloc[i] > avg_range * 1.2
+            and df["Close"].iloc[i - 1] > df["Open"].iloc[i - 1]
+        ):
+            ob_list.append(
+                {
+                    "tipo": "OB Bajista",
+                    "zona_inferior": df["Low"].iloc[i - 1],
+                    "zona_superior": df["High"].iloc[i - 1],
+                    "tiempo": df.index[i - 1],
+                }
+            )
 
     precio_actual = df_5m_ref["Close"].iloc[-1]
 
-    zonas_res = sorted(
-        [r for r in resistencias if r >= precio_actual * 0.995], reverse=False
-    )[:3]
-    zonas_sop = sorted(
-        [s for s in soportes if s <= precio_actual * 1.005], reverse=True
-    )[:3]
+    # Filtrar zonas recientes y cercanas al precio actual (últimos elementos de las listas)
+    valid_fvgs = [
+        f
+        for f in fvg_list[-15:]
+        if abs(f["zona_inferior"] - precio_actual) / precio_actual < 0.02
+    ]
+    valid_obs = [
+        o
+        for o in ob_list[-15:]
+        if abs(o["zona_inferior"] - precio_actual) / precio_actual < 0.02
+    ]
 
-    return zonas_res, zonas_sop, precio_actual
+    return valid_fvgs, valid_obs, precio_actual
 
 
-zonas_resistencia, zonas_soporte, precio_actual = identificar_zonas_1h(
-    data_1h, data_5m
-)
+fvgs, obs, precio_actual = detectar_zonas_smc_1h(data_1h, data_5m)
 
-# Pestañas principales de navegación
+# Interfaz en Pestañas
 tab1, tab2, tab3 = st.tabs(
     [
-        "📊 Gráficos Multi-Temporalidad (1H y 5M)",
-        "🔍 Análisis y Confluencia",
-        "💡 Plan de Entrada y Riesgo",
+        "📊 Gráficos SMC (1H Zonas + 5M Gatillo)",
+        "🔍 Auditoría de Zonas (OB & FVG)",
+        "💡 Plan y Gestión de Riesgo",
     ]
 )
 
 with tab1:
-    st.subheader(f"Estructura para {ticker_symbol}")
+    st.subheader(f"Estructura Institucional para {ticker_symbol}")
+    col1, col2 = st.columns(2)
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Precio Actual", f"{precio_actual:.5f}")
-    col2.metric(
-        "Resistencia 1H cercana",
-        (
-            f"{zonas_resistencia[0]:.5f}"
-            if len(zonas_resistencia) > 0
-            else "N/A"
-        ),
-    )
-    col3.metric(
-        "Soporte 1H cercano",
-        f"{zonas_soporte[0]:.5f}" if len(zonas_soporte) > 0 else "N/A",
-    )
-
-    st.markdown("---")
-
-    # Layout en dos columnas para ver ambos gráficos lado a lado (o apilados si prefieres)
-    col_g1, col_g2 = st.columns(2)
-
-    with col_g1:
-        st.markdown("### ⏱️ Temporalidad 1H (Zonas Macro)")
-        df_1h_plot = data_1h.tail(120)  # Últimas 120 velas de 1 hora
+    with col1:
+        st.markdown("### ⏱️ Zonas 1H (Order Blocks & FVGs)")
+        df_1h_plot = data_1h.tail(100)
         fig_1h = go.Figure(
             data=[
                 go.Candlestick(
@@ -133,41 +162,37 @@ with tab1:
                     high=df_1h_plot["High"],
                     low=df_1h_plot["Low"],
                     close=df_1h_plot["Close"],
-                    name="1H Candles",
+                    name="1H",
                 )
             ]
         )
 
-        # Pintar las zonas de 1H en su propio gráfico para ver de dónde salen
-        for r in zonas_resistencia:
-            fig_1h.add_hline(
-                y=r,
-                line_dash="dash",
-                line_color="red",
-                annotation_text=f"Res: {r:.5f}",
-                annotation_position="top right",
-            )
-        for s in zonas_soporte:
-            fig_1h.add_hline(
-                y=s,
-                line_dash="dash",
-                line_color="green",
-                annotation_text=f"Sop: {s:.5f}",
-                annotation_position="bottom right",
+        # Dibujar Order Blocks en el gráfico de 1H
+        for ob in obs:
+            color_ob = "blue" if "Alcista" in ob["tipo"] else "orange"
+            fig_1h.add_shape(
+                type="rect",
+                x0=ob["tiempo"],
+                x1=df_1h_plot.index[-1],
+                y0=ob["zona_inferior"],
+                y1=ob["zona_superior"],
+                line=dict(color=color_ob, width=1),
+                fillcolor=color_ob,
+                opacity=0.3,
             )
 
         fig_1h.update_layout(
-            title="Estructura de 1H (Origen de Zonas)",
-            xaxis_title="Fecha / Hora",
+            title="Zonas de Order Blocks (1H)",
+            xaxis_title="Fecha",
             yaxis_title="Precio",
             height=500,
             template="plotly_dark",
         )
         st.plotly_chart(fig_1h, use_container_width=True)
 
-    with col_g2:
-        st.markdown("### ⏱️ Temporalidad 5M (Gatillo de Entrada)")
-        df_5m_plot = data_5m.tail(150)  # Últimas 150 velas de 5 minutos
+    with col2:
+        st.markdown("### ⏱️ Seguimiento y Gatillo en 5M")
+        df_5m_plot = data_5m.tail(150)
         fig_5m = go.Figure(
             data=[
                 go.Candlestick(
@@ -176,32 +201,24 @@ with tab1:
                     high=df_5m_plot["High"],
                     low=df_5m_plot["Low"],
                     close=df_5m_plot["Close"],
-                    name="5M Candles",
+                    name="5M",
                 )
             ]
         )
 
-        # Repetir las líneas de 1H sobre el gráfico de 5M para ver la interacción en tiempo real
-        for r in zonas_resistencia:
+        # Proyectar Order Blocks en 5M para buscar confirmación de giro o quiebre interno
+        for ob in obs:
+            color_ob = "blue" if "Alcista" in ob["tipo"] else "orange"
             fig_5m.add_hline(
-                y=r,
-                line_dash="dash",
-                line_color="red",
-                annotation_text=f"Res 1H",
-                annotation_position="top right",
-            )
-        for s in zonas_soporte:
-            fig_5m.add_hline(
-                y=s,
-                line_dash="dash",
-                line_color="green",
-                annotation_text=f"Sop 1H",
-                annotation_position="bottom right",
+                y=ob["zona_superior"],
+                line_dash="dot",
+                line_color=color_ob,
+                annotation_text=ob["tipo"],
             )
 
         fig_5m.update_layout(
-            title="Acción del Precio en 5M (Confirmación)",
-            xaxis_title="Fecha / Hora",
+            title="Reacción del Precio en 5M",
+            xaxis_title="Fecha",
             yaxis_title="Precio",
             height=500,
             template="plotly_dark",
@@ -209,59 +226,36 @@ with tab1:
         st.plotly_chart(fig_5m, use_container_width=True)
 
 with tab2:
-    st.subheader("📋 Confluencia entre 1H y 5M")
+    st.subheader("📋 Detalle de Zonas Institucionales Detectadas")
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.markdown("### ⏱️ Zonas Identificadas en 1H")
-        st.write(
-            "Los niveles se calculan analizando los máximos y mínimos de pivote recientes en la temporalidad de 1 hora:"
-        )
-        if len(zonas_resistencia) > 0:
-            st.success(
-                f"🔴 Resistencias 1H: {[round(x, 5) for x in zonas_resistencia]}"
-            )
-        if len(zonas_soporte) > 0:
-            st.success(
-                f"🟢 Soportes 1H: {[round(x, 5) for x in zonas_soporte]}"
-            )
+        st.markdown("### 🟦 Order Blocks (OB) Activos en 1H")
+        if obs:
+            for o in obs:
+                st.info(
+                    f"• **{o['tipo']}** | Rango: {o['zona_inferior']:.5f} - {o['zona_superior']:.5f}"
+                )
+        else:
+            st.warning("No se detectaron Order Blocks cercanos al precio actual.")
 
     with col_b:
-        st.markdown("### ⏱️ Lectura de Acción del Precio en 5M")
-        ultimas_velas = data_5m.tail(3)
-        cierre_ult = ultimas_velas["Close"].iloc[-1]
-        apertura_ult = ultimas_velas["Open"].iloc[-1]
-
-        if cierre_ult > apertura_ult:
-            st.info(
-                "ℹ️ **Estado 5M:** Vela actual alcista. Espere acercamiento y rechazo en los soportes de 1H marcados en verde."
-            )
+        st.markdown("### 🟩 Fair Value Gaps (FVG) Activos en 1H")
+        if fvgs:
+            for f in fvgs:
+                st.success(
+                    f"• **{f['tipo']}** | Zona: {f['zona_inferior']:.5f} - {f['zona_superior']:.5f}"
+                )
         else:
-            st.info(
-                "ℹ️ **Estado 5M:** Vela actual bajista. Espere acercamiento y rechazo en las resistencias de 1H marcadas en rojo."
-            )
+            st.warning("No se detectaron FVGs cercanos al precio actual.")
 
 with tab3:
-    st.subheader("🎯 Plan de Operación y Control de Riesgo")
-    st.markdown(
-        """
-    1. **Ubicación (1H):** Valida en el gráfico de 1H por qué la zona fue trazada (confluencia de máximos/mínimos anteriores).
-    2. **Gatillo (5M):** Observa cómo reacciona el precio en el gráfico de 5M al tocar esa línea institucional. Busca velas de rechazo o ruptura de estructura interna.
-    3. **Gestión de Riesgo:**
-    """
-    )
-
-    st.markdown("---")
-    st.markdown("### 🛠️ Panel de Control de Sesión")
+    st.subheader("🎯 Panel de Gestión de Riesgo y Sesión")
     op_abiertas = st.number_input(
-        "Operaciones abiertas actualmente:",
-        min_value=0,
-        max_value=10,
-        value=1,
-        step=1,
+        "Operaciones abiertas actualmente:", 0, 10, 1, 1
     )
     ops_perdidas_hoy = st.number_input(
-        "Operaciones perdedoras hoy:", min_value=0, max_value=10, value=0, step=1
+        "Operaciones perdedoras hoy:", 0, 10, 0, 1
     )
 
     if op_abiertas > 3:
@@ -270,9 +264,9 @@ with tab3:
         )
     elif ops_perdidas_hoy >= 4:
         st.error(
-            "🚨 **STOP TRADING:** Límite diario de 4 operaciones perdedoras alcanzado. Detén la operativa."
+            "🚨 **STOP TRADING:** Límite diario de 4 operaciones perdedoras alcanzado. Cierra pantallas."
         )
     else:
         st.success(
-            "✅ **Estado de Riesgo Aceptable:** Operando dentro de los parámetros permitidos."
+            "✅ **Riesgo Controlado:** Puedes operar bajo supervisión de tus reglas."
         )
